@@ -1,0 +1,145 @@
+# Exemplo documental inativo: requer configuracao propria antes de qualquer uso.
+# Envia o que estiver pendente uma vez por dia.
+# Abre o firewall do Azure SQL só para o IP deste runner e remove a regra ao final.
+# Os segredos de banco e e-mail ficam nas secrets do repositório, não aqui.
+name: Envio automático
+
+on:
+  schedule:
+    # 11:10 e 14:40 em São Paulo. O segundo horário cobre um descarte do primeiro.
+    # O histórico impede um segundo e-mail do mesmo usuário, tipo e período.
+    - cron: "10 14 * * *"
+    - cron: "40 17 * * *"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  packages: read
+
+concurrency:
+  group: envio-automatico
+  cancel-in-progress: false
+
+jobs:
+  enviar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMAGE: ghcr.io/usuario-exemplo/trixter-envios:latest
+      AZURE_CLIENT_ID: 00000000-0000-0000-0000-000000000001
+      AZURE_TENANT_ID: 00000000-0000-0000-0000-000000000002
+      AZURE_SUBSCRIPTION_ID: 00000000-0000-0000-0000-000000000003
+      RULE_NAME: trixter-gha-${{ github.run_id }}
+      TRIXTER_AUTOMACAO_FUSO_HORARIO: America/Sao_Paulo
+      TRIXTER_AUTOMACAO_MAX_TENTATIVAS: "3"
+      TRIXTER_DATABASE_DRIVER: ODBC Driver 18 for SQL Server
+      TRIXTER_DATABASE_SERVER: servidor-sql-exemplo.database.windows.net
+      TRIXTER_DATABASE_NAME: banco-exemplo
+      TRIXTER_DATABASE_TRUSTED_CONNECTION: "no"
+      TRIXTER_DATABASE_ENCRYPT: "yes"
+      TRIXTER_DATABASE_TRUST_SERVER_CERTIFICATE: "no"
+      TRIXTER_EMAIL_SERVIDOR: smtp-relay.brevo.com
+      TRIXTER_EMAIL_PORTA: "587"
+      TRIXTER_EMAIL_REMETENTE: contato@trixter.app.br
+    steps:
+      - name: Conferir secrets
+        env:
+          TRIXTER_DATABASE_USUARIO: ${{ secrets.TRIXTER_DATABASE_USUARIO }}
+          TRIXTER_DATABASE_SENHA: ${{ secrets.TRIXTER_DATABASE_SENHA }}
+          TRIXTER_EMAIL_USUARIO: ${{ secrets.TRIXTER_EMAIL_USUARIO }}
+          TRIXTER_EMAIL_SENHA: ${{ secrets.TRIXTER_EMAIL_SENHA }}
+        run: |
+          missing=0
+          for name in TRIXTER_DATABASE_USUARIO TRIXTER_DATABASE_SENHA TRIXTER_EMAIL_USUARIO TRIXTER_EMAIL_SENHA; do
+            if [ -z "${!name}" ]; then
+              echo "Secret ausente: $name"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Entrar no Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Abrir o firewall para este runner
+        id: firewall
+        run: |
+          set -euo pipefail
+          existentes=$(az sql server firewall-rule list -g grupo-recursos-exemplo -s servidor-sql-exemplo --query "[?starts_with(name, 'trixter-gha-')].name" -o tsv)
+          if [ -n "$existentes" ]; then
+            while IFS= read -r regra; do
+              [ -z "$regra" ] && continue
+              az rest --method delete --uri "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/grupo-recursos-exemplo/providers/Microsoft.Sql/servers/servidor-sql-exemplo/firewallRules/${regra}?api-version=2021-11-01"
+            done <<< "$existentes"
+          fi
+          ip=$(curl -fsS --max-time 20 https://api.ipify.org | tr -d '[:space:]')
+          if ! [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            echo "IP público inválido"
+            exit 1
+          fi
+          echo "Runner IP: $ip"
+          az sql server firewall-rule create \
+            -g grupo-recursos-exemplo \
+            -s servidor-sql-exemplo \
+            -n "$RULE_NAME" \
+            --start-ip-address "$ip" \
+            --end-ip-address "$ip" \
+            --query name -o tsv
+
+      - name: Enviar
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIXTER_DATABASE_USUARIO: ${{ secrets.TRIXTER_DATABASE_USUARIO }}
+          TRIXTER_DATABASE_SENHA: ${{ secrets.TRIXTER_DATABASE_SENHA }}
+          TRIXTER_EMAIL_USUARIO: ${{ secrets.TRIXTER_EMAIL_USUARIO }}
+          TRIXTER_EMAIL_SENHA: ${{ secrets.TRIXTER_EMAIL_SENHA }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+          sleep 45
+          tentativa=1
+          while [ "$tentativa" -le 3 ]; do
+            set +e
+            docker run --rm \
+              -e TRIXTER_AUTOMACAO_FUSO_HORARIO \
+              -e TRIXTER_AUTOMACAO_MAX_TENTATIVAS \
+              -e TRIXTER_DATABASE_DRIVER \
+              -e TRIXTER_DATABASE_SERVER \
+              -e TRIXTER_DATABASE_NAME \
+              -e TRIXTER_DATABASE_TRUSTED_CONNECTION \
+              -e TRIXTER_DATABASE_ENCRYPT \
+              -e TRIXTER_DATABASE_TRUST_SERVER_CERTIFICATE \
+              -e TRIXTER_EMAIL_SERVIDOR \
+              -e TRIXTER_EMAIL_PORTA \
+              -e TRIXTER_EMAIL_REMETENTE \
+              -e TRIXTER_DATABASE_USUARIO \
+              -e TRIXTER_DATABASE_SENHA \
+              -e TRIXTER_EMAIL_USUARIO \
+              -e TRIXTER_EMAIL_SENHA \
+              "$IMAGE" 2>&1 | tee envio.log
+            codigo=${PIPESTATUS[0]}
+            set -e
+            if [ "$codigo" -eq 0 ]; then
+              exit 0
+            fi
+            # Só a abertura registra operacao=conectar nesta frase.
+            if [ "$tentativa" -eq 3 ] || ! grep -Eq 'Executor interrompido \([^)]*sqlstate=HYT00 operacao=conectar|Executor interrompido \([^)]*sqlstate=HYT01 operacao=conectar|Executor interrompido \([^)]*operacao=conectar erro_sql=40615' envio.log; then
+              exit "$codigo"
+            fi
+            if [ "$tentativa" -eq 1 ]; then
+              echo "Conexão inicial indisponível. Nova tentativa em 60s."
+              sleep 60
+            else
+              echo "Conexão inicial indisponível. Nova tentativa em 120s."
+              sleep 120
+            fi
+            tentativa=$((tentativa + 1))
+          done
+
+      - name: Fechar o firewall
+        if: always() && steps.firewall.outcome == 'success'
+        run: az rest --method delete --uri "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/grupo-recursos-exemplo/providers/Microsoft.Sql/servers/servidor-sql-exemplo/firewallRules/${RULE_NAME}?api-version=2021-11-01"

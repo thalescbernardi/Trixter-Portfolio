@@ -1,0 +1,66 @@
+# Exemplo documental inativo: requer configuracao propria antes de qualquer uso.
+# Valida apenas a imagem local do runner, com os dados ficticios dos testes.
+name: Validação Docker da integração
+
+on:
+  push:
+    branches:
+      - integracao/final-local
+
+permissions:
+  contents: read
+
+jobs:
+  validar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PYTHONUTF8: "1"
+      TRIXTER_TESTAR_IMAGEM_WEB: "1"
+    steps:
+      - name: Obter o código
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Registrar o commit e conferir o Docker
+        run: |
+          git rev-parse HEAD
+          docker version
+
+      - name: Preparar o Python dos testes
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependências dos testes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc unixodbc-dev
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-testes.txt
+
+      # O teste faz o unico build, verifica ODBC, secrets ficticios e saude
+      # em 127.0.0.1, e remove seus dois containers ao terminar.
+      - name: Executar os testes da imagem web
+        run: python -m pytest tests/test_imagem_web.py -q
+
+      - name: Confirmar Python 3.12 na imagem construída
+        run: |
+          docker run --rm --entrypoint python trixter-web:teste -c \
+            "import sys; print(sys.version); assert sys.version_info[:2] == (3, 12)"
+
+      - name: Limpar somente os recursos Docker desta validação
+        if: always()
+        run: |
+          resultado=0
+          for container in trixter-web-teste trixter-web-segredos; do
+            if docker container inspect "$container" >/dev/null 2>&1; then
+              docker rm --force "$container" || resultado=1
+            fi
+          done
+          if docker image inspect trixter-web:teste >/dev/null 2>&1; then
+            docker image rm trixter-web:teste || resultado=1
+          fi
+          exit "$resultado"

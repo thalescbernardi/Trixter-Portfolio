@@ -1,0 +1,6 @@
+[server]
+# 2 MiB. O Streamlit multiplica este inteiro por 1024 * 1024.
+maxUploadSize = 2
+
+[browser]
+gatherUsageStats = false

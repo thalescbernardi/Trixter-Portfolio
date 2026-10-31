@@ -1,0 +1,421 @@
+# Exemplo documental inativo: requer configuracao propria antes de qualquer uso.
+# Publica a imagem do executor pela tag do commit e só move latest na promoção manual.
+# Não executa envios e não recebe secrets de banco, e-mail ou Azure.
+#
+# Publicar grava ghcr.io/usuario-exemplo/trixter-envios:<sha de 40 caracteres>.
+# Promover aponta latest para um SHA já publicado ou para um digest sha256
+# somente depois de confirmar os dois digests esperados.
+# O rollback usa o digest sha256:2708f7ef0af65093f1f79d3e0780df8952f05788f17bc39fb7dd092708decac8.
+#
+# --prefer-index=false preserva o digest de um manifesto simples e também o de um índice OCI.
+# Uma divergência na verificação final não dispara correção automática.
+#
+# O grupo abaixo serializa Publicar e Promover deste workflow.
+# Ele não altera a tag de backup nem impede o Envio automático de ler latest.
+name: Imagem dos envios
+
+on:
+  workflow_dispatch:
+    inputs:
+      operacao:
+        description: Publicar a tag do commit ou promover uma imagem já publicada para latest
+        required: true
+        type: choice
+        options:
+          - Publicar
+          - Promover
+      referencia:
+        description: Somente para Promover. SHA completo de 40 caracteres ou digest sha256 de 64 caracteres
+        required: false
+        type: string
+        default: ""
+      digest_origem_esperado:
+        description: Somente para Promover. Digest sha256 esperado da origem, com 64 hexadecimais minúsculos
+        required: false
+        type: string
+        default: ""
+      digest_latest_esperado:
+        description: Somente para Promover. Digest sha256 em que latest precisa estar antes da promoção
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: trixter-envios-latest
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  recusar:
+    permissions: {}
+    if: inputs.operacao != 'Publicar' && inputs.operacao != 'Promover'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Recusar a operação
+        run: |
+          echo "A operação informada não é Publicar nem Promover." >&2
+          exit 1
+
+  publicar:
+    permissions:
+      contents: read
+      packages: write
+    if: inputs.operacao == 'Publicar'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      IMAGE: ghcr.io/usuario-exemplo/trixter-envios:${{ github.sha }}
+      LATEST: ghcr.io/usuario-exemplo/trixter-envios:latest
+    steps:
+      - name: Obter o código
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Entrar no GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Consultar latest e a tag do commit
+        id: consultar
+        run: |
+          set -euo pipefail
+
+          registrar() {
+            {
+              echo "## Imagem dos envios"
+              echo ""
+              echo "- Digest inicial de latest: \`${1}\`"
+              echo "- Digest solicitado: \`${2}\`"
+              echo "- Digest final de latest: \`${3}\`"
+              echo "- Resultado: ${4}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          manifest_ausente() {
+            printf '%s\n' "$1" | grep -Eqi 'not found|manifest unknown|name unknown|no such manifest' \
+              && ! printf '%s\n' "$1" | grep -Eqi 'unauthorized|denied|authentication required|insufficient_scope|timeout|timed out|connection reset|eof'
+          }
+
+          if ! printf '%s' "$IMAGE" | grep -Eq '^ghcr.io/usuario-exemplo/trixter-envios:[0-9a-f]{40}$'; then
+            registrar "não identificado" "não identificado" "não identificado" "a tag de publicação não é o SHA completo de 40 caracteres. Nenhuma imagem foi enviada."
+            exit 1
+          fi
+
+          set +e
+          saida_latest=$(docker buildx imagetools inspect "$LATEST" 2>&1)
+          codigo_latest=$?
+          set -e
+          if [ "$codigo_latest" -ne 0 ]; then
+            printf '%s\n' "$saida_latest" >&2
+            if manifest_ausente "$saida_latest"; then
+              registrar "não identificado" "não identificado" "não identificado" "latest não foi encontrada. Nenhuma publicação foi feita."
+            else
+              registrar "não identificado" "não identificado" "não identificado" "falhou ao consultar latest por autenticação ou comunicação. Nenhuma publicação foi feita."
+            fi
+            exit 1
+          fi
+          inicial=$(printf '%s\n' "$saida_latest" | awk '/^Digest:[[:space:]]/ { print $2; exit }')
+          if ! printf '%s' "$inicial" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            registrar "não identificado" "não identificado" "não identificado" "o digest de latest não pôde ser identificado. Nenhuma publicação foi feita."
+            exit 1
+          fi
+
+          set +e
+          saida_tag=$(docker buildx imagetools inspect "$IMAGE" 2>&1)
+          codigo_tag=$?
+          set -e
+          if [ "$codigo_tag" -eq 0 ]; then
+            existente=$(printf '%s\n' "$saida_tag" | awk '/^Digest:[[:space:]]/ { print $2; exit }')
+            registrar "$inicial" "${existente:-não identificado}" "$inicial" "a tag do commit já existe. Ela não foi substituída e latest não foi alterada."
+            exit 1
+          fi
+          if ! manifest_ausente "$saida_tag"; then
+            printf '%s\n' "$saida_tag" >&2
+            registrar "$inicial" "não identificado" "$inicial" "falhou ao consultar a tag do commit por autenticação ou comunicação. Nenhuma publicação foi feita."
+            exit 1
+          fi
+
+          echo "DIGEST_LATEST_INICIAL=${inicial}" >> "$GITHUB_ENV"
+
+      - name: Construir a imagem
+        id: construir
+        run: |
+          if ! printf '%s' "$IMAGE" | grep -Eq '^ghcr.io/usuario-exemplo/trixter-envios:[0-9a-f]{40}$'; then
+            echo "A construção só aceita a tag do SHA completo." >&2
+            exit 1
+          fi
+          docker build --tag "$IMAGE" .
+
+      - name: Validar o ODBC Driver 18
+        id: odbc
+        run: |
+          docker run --rm --entrypoint python "$IMAGE" -c "import pyodbc; drivers = pyodbc.drivers(); print(drivers); raise SystemExit(0 if 'ODBC Driver 18 for SQL Server' in drivers else 1)"
+
+      - name: Validar o entry point
+        id: ajuda
+        run: docker run --rm "$IMAGE" --help
+
+      - name: Publicar a tag do commit
+        id: enviar
+        run: |
+          set -euo pipefail
+
+          registrar() {
+            {
+              echo "## Imagem dos envios"
+              echo ""
+              echo "- Digest inicial de latest: \`${1}\`"
+              echo "- Digest solicitado: \`${2}\`"
+              echo "- Digest final de latest: \`${3}\`"
+              echo "- Resultado: ${4}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          ler_digest() {
+            local saida codigo digest
+            set +e
+            saida=$(docker buildx imagetools inspect "$1" 2>&1)
+            codigo=$?
+            set -e
+            if [ "$codigo" -ne 0 ]; then
+              printf '%s\n' "$saida" >&2
+              return "$codigo"
+            fi
+            digest=$(printf '%s\n' "$saida" | awk '/^Digest:[[:space:]]/ { print $2; exit }')
+            if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+              echo "O digest de $1 não pôde ser identificado." >&2
+              printf '%s\n' "$saida" >&2
+              return 1
+            fi
+            printf '%s\n' "$digest"
+          }
+
+          inicial="${DIGEST_LATEST_INICIAL:-não identificado}"
+          if ! printf '%s' "$IMAGE" | grep -Eq '^ghcr.io/usuario-exemplo/trixter-envios:[0-9a-f]{40}$'; then
+            registrar "$inicial" "não identificado" "$inicial" "o envio foi recusado porque a tag não é o SHA completo."
+            exit 1
+          fi
+          if [ "$IMAGE" = "$LATEST" ]; then
+            registrar "$inicial" "não identificado" "$inicial" "o envio de latest foi recusado nesta operação."
+            exit 1
+          fi
+
+          if ! docker push "$IMAGE"; then
+            set +e
+            final=$(ler_digest "$LATEST")
+            set -e
+            registrar "$inicial" "não identificado" "${final:-não identificado}" "falhou ao enviar a tag do commit. Nenhuma correção automática foi feita."
+            exit 1
+          fi
+
+          solicitado=$(ler_digest "$IMAGE") || {
+            set +e
+            final=$(ler_digest "$LATEST")
+            set -e
+            registrar "$inicial" "não identificado" "${final:-não identificado}" "a tag do commit foi enviada, mas o digest não pôde ser confirmado. Nenhuma correção automática foi feita."
+            exit 1
+          }
+          final=$(ler_digest "$LATEST") || {
+            registrar "$inicial" "$solicitado" "não identificado" "falhou ao reler latest depois da publicação. Nenhuma correção automática foi feita."
+            exit 1
+          }
+          if [ "$final" != "$inicial" ]; then
+            echo "latest mudou de ${inicial} para ${final}." >&2
+            registrar "$inicial" "$solicitado" "$final" "latest divergiu depois da publicação. Nenhuma correção automática foi feita."
+            exit 1
+          fi
+          registrar "$inicial" "$solicitado" "$final" "a tag do commit foi publicada. latest permaneceu inalterada."
+
+      - name: Registrar interrupção antes do envio
+        if: failure() && steps.consultar.outcome == 'success' && steps.enviar.outcome == 'skipped'
+        run: |
+          set -euo pipefail
+          inicial="${DIGEST_LATEST_INICIAL:-não identificado}"
+          set +e
+          saida_final=$(docker buildx imagetools inspect "$LATEST" 2>&1)
+          codigo_final=$?
+          set -e
+          final=$(printf '%s\n' "$saida_final" | awk '/^Digest:[[:space:]]/ { print $2; exit }')
+          if [ "$codigo_final" -ne 0 ] || ! printf '%s' "$final" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            final="não identificado"
+          fi
+          resultado="a publicação foi interrompida antes do envio."
+          if [ "$final" != "não identificado" ] && [ "$inicial" != "$final" ]; then
+            resultado="${resultado} latest divergiu. Nenhuma correção automática foi feita."
+          fi
+          {
+            echo "## Imagem dos envios"
+            echo ""
+            echo "- Digest inicial de latest: \`${inicial}\`"
+            echo "- Digest solicitado: \`não identificado\`"
+            echo "- Digest final de latest: \`${final}\`"
+            echo "- Resultado: ${resultado}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+  promover:
+    permissions:
+      packages: write
+    if: inputs.operacao == 'Promover'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      REFERENCIA: ${{ inputs.referencia }}
+      DIGEST_ORIGEM_ESPERADO: ${{ inputs.digest_origem_esperado }}
+      DIGEST_LATEST_ESPERADO: ${{ inputs.digest_latest_esperado }}
+      LATEST: ghcr.io/usuario-exemplo/trixter-envios:latest
+    steps:
+      - name: Entrar no GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Promover a origem para latest
+        run: |
+          set -euo pipefail
+
+          registrar() {
+            {
+              echo "## Imagem dos envios"
+              echo ""
+              echo "- Digest inicial de latest: \`${1}\`"
+              echo "- Digest solicitado: \`${2}\`"
+              echo "- Digest final de latest: \`${3}\`"
+              echo "- Resultado: ${4}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          ler_digest() {
+            local saida codigo digest
+            set +e
+            saida=$(docker buildx imagetools inspect "$1" 2>&1)
+            codigo=$?
+            set -e
+            if [ "$codigo" -ne 0 ]; then
+              printf '%s\n' "$saida" >&2
+              return "$codigo"
+            fi
+            digest=$(printf '%s\n' "$saida" | awk '/^Digest:[[:space:]]/ { print $2; exit }')
+            if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+              echo "O digest de $1 não pôde ser identificado." >&2
+              printf '%s\n' "$saida" >&2
+              return 1
+            fi
+            printf '%s\n' "$digest"
+          }
+
+          manifest_ausente() {
+            printf '%s\n' "$1" | grep -Eqi 'not found|manifest unknown|name unknown|no such manifest' \
+              && ! printf '%s\n' "$1" | grep -Eqi 'unauthorized|denied|authentication required|insufficient_scope|timeout|timed out|connection reset|eof'
+          }
+
+          digest_valido() {
+            printf '%s' "$1" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          }
+
+          if ! digest_valido "$DIGEST_LATEST_ESPERADO"; then
+            registrar "não identificado" "não identificado" "não identificado" "o digest esperado de latest deve ser sha256: seguido de 64 hexadecimais minúsculos. Nenhuma promoção foi feita."
+            exit 1
+          fi
+          if ! digest_valido "$DIGEST_ORIGEM_ESPERADO"; then
+            registrar "não identificado" "não identificado" "não identificado" "o digest esperado da origem deve ser sha256: seguido de 64 hexadecimais minúsculos. Nenhuma promoção foi feita."
+            exit 1
+          fi
+          if [ "$DIGEST_LATEST_ESPERADO" = "$DIGEST_ORIGEM_ESPERADO" ]; then
+            registrar "não identificado" "não identificado" "não identificado" "os digests esperados são iguais. Nenhuma promoção foi feita."
+            exit 1
+          fi
+
+          registro=ghcr.io/usuario-exemplo/trixter-envios
+          if printf '%s' "$REFERENCIA" | grep -Eq '^[0-9a-f]{40}$'; then
+            origem="${registro}:${REFERENCIA}"
+          elif printf '%s' "$REFERENCIA" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            origem="${registro}@${REFERENCIA}"
+          else
+            registrar "não identificado" "não identificado" "não identificado" "a referência deve ser um SHA de 40 caracteres ou um digest sha256 de 64 caracteres. latest não foi alterada."
+            exit 1
+          fi
+
+          set +e
+          saida_latest=$(docker buildx imagetools inspect "$LATEST" 2>&1)
+          codigo_latest=$?
+          set -e
+          if [ "$codigo_latest" -ne 0 ]; then
+            printf '%s\n' "$saida_latest" >&2
+            if manifest_ausente "$saida_latest"; then
+              registrar "não identificado" "não identificado" "não identificado" "latest não foi encontrada. Nenhuma promoção foi feita."
+            else
+              registrar "não identificado" "não identificado" "não identificado" "falhou ao consultar latest por autenticação ou comunicação. Nenhuma promoção foi feita."
+            fi
+            exit 1
+          fi
+          inicial=$(printf '%s\n' "$saida_latest" | awk '/^Digest:[[:space:]]/ { print $2; exit }')
+          if ! printf '%s' "$inicial" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            registrar "não identificado" "não identificado" "não identificado" "o digest de latest não pôde ser identificado. Nenhuma promoção foi feita."
+            exit 1
+          fi
+          if [ "$inicial" != "$DIGEST_LATEST_ESPERADO" ]; then
+            registrar "$inicial" "não identificado" "$inicial" "latest não está no digest anterior esperado. Nenhuma promoção foi feita."
+            exit 1
+          fi
+
+          set +e
+          saida_origem=$(docker buildx imagetools inspect "$origem" 2>&1)
+          codigo_origem=$?
+          set -e
+          if [ "$codigo_origem" -ne 0 ]; then
+            printf '%s\n' "$saida_origem" >&2
+            if manifest_ausente "$saida_origem"; then
+              registrar "$inicial" "não identificado" "$inicial" "a origem não existe. latest não foi alterada."
+            else
+              registrar "$inicial" "não identificado" "$inicial" "falhou ao consultar a origem por autenticação ou comunicação. latest não foi alterada."
+            fi
+            exit 1
+          fi
+          solicitado=$(printf '%s\n' "$saida_origem" | awk '/^Digest:[[:space:]]/ { print $2; exit }')
+          if ! printf '%s' "$solicitado" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            registrar "$inicial" "não identificado" "$inicial" "o digest da origem não pôde ser identificado. latest não foi alterada."
+            exit 1
+          fi
+          if [ "$solicitado" != "$DIGEST_ORIGEM_ESPERADO" ]; then
+            registrar "$inicial" "$solicitado" "$inicial" "a origem não está no digest esperado. latest não foi alterada."
+            exit 1
+          fi
+
+          if [ "$inicial" = "$solicitado" ]; then
+            registrar "$inicial" "$solicitado" "$inicial" "latest já apontava para o digest solicitado. Nenhuma publicação foi feita."
+            exit 0
+          fi
+
+          fonte="${registro}@${solicitado}"
+          imediato=$(ler_digest "$LATEST") || {
+            registrar "$inicial" "$solicitado" "$inicial" "falhou ao reler latest imediatamente antes da promoção. Nenhuma promoção foi feita."
+            exit 1
+          }
+          if [ "$imediato" != "$DIGEST_LATEST_ESPERADO" ]; then
+            registrar "$inicial" "$solicitado" "$imediato" "latest mudou depois da primeira leitura. Nenhuma promoção foi feita."
+            exit 1
+          fi
+
+          if ! docker buildx imagetools create --prefer-index=false --tag "$LATEST" "$fonte"; then
+            set +e
+            final=$(ler_digest "$LATEST")
+            set -e
+            registrar "$inicial" "$solicitado" "${final:-não identificado}" "falhou ao promover. Nenhuma correção automática foi feita."
+            exit 1
+          fi
+
+          final=$(ler_digest "$LATEST") || final="não identificado"
+          origem_final=$(ler_digest "$origem") || origem_final="não identificado"
+          fonte_final=$(ler_digest "$fonte") || fonte_final="não identificado"
+          if [ "$final" != "$solicitado" ] || [ "$final" != "$DIGEST_ORIGEM_ESPERADO" ] || [ "$origem_final" != "$solicitado" ] || [ "$fonte_final" != "$solicitado" ]; then
+            echo "A verificação encontrou latest em ${final}, a origem em ${origem_final} e o digest resolvido em ${fonte_final}; o esperado era ${solicitado}." >&2
+            registrar "$inicial" "$solicitado" "$final" "a verificação final divergiu. Nenhuma correção automática foi feita."
+            exit 1
+          fi
+          registrar "$inicial" "$solicitado" "$final" "latest foi promovida para o digest resolvido antes da operação."

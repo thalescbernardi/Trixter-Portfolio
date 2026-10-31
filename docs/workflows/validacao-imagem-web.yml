@@ -1,0 +1,94 @@
+# Exemplo documental inativo: requer configuracao propria antes de qualquer uso.
+# Constrói e sobe a imagem da interface só neste runner.
+# Não publica, não recebe secrets do repositório e não acessa o banco nem o e-mail.
+name: Validação da imagem web
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      IMAGE: trixter-web:validacao
+      SENHA_FICTICIA: senha-ficticia-de-teste
+      SENHA_BANCO_FICTICIA: senha-banco-ficticia
+    steps:
+      - name: Obter o código
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Construir a imagem web
+        run: docker build --file Dockerfile.web --tag "$IMAGE" .
+
+      - name: Confirmar que o build não incorporou secrets.toml
+        run: |
+          docker run --rm --entrypoint python "$IMAGE" -c \
+            "from pathlib import Path; raise SystemExit(0 if not Path('/app/.streamlit/secrets.toml').exists() else 1)"
+
+      - name: Subir o Streamlit com valores fictícios
+        run: |
+          docker run --detach --name trixter-web-validacao \
+            --publish 8501:8501 \
+            --env WEBSITES_PORT=8501 \
+            --env TRIXTER_WEB_DATABASE_DRIVER="ODBC Driver 18 for SQL Server" \
+            --env TRIXTER_WEB_DATABASE_SERVER=servidor.exemplo \
+            --env TRIXTER_WEB_DATABASE_NAME=banco_ficticio \
+            --env TRIXTER_WEB_DATABASE_USERNAME=usuario_ficticio \
+            --env TRIXTER_WEB_DATABASE_PASSWORD="$SENHA_BANCO_FICTICIA" \
+            --env TRIXTER_WEB_EMAIL_REMETENTE=web@exemplo.teste \
+            --env TRIXTER_WEB_EMAIL_SERVIDOR=smtp.exemplo.teste \
+            --env TRIXTER_WEB_EMAIL_PORTA=587 \
+            --env TRIXTER_WEB_EMAIL_USUARIO=smtp-ficticio \
+            --env TRIXTER_WEB_EMAIL_SENHA="$SENHA_FICTICIA" \
+            "$IMAGE"
+
+      - name: Consultar a saúde na porta 8501
+        run: |
+          codigo=""
+          for _ in $(seq 1 90); do
+            codigo="$(curl --silent --output /tmp/saude.txt --write-out "%{http_code}" http://127.0.0.1:8501/_stcore/health || true)"
+            if [ "$codigo" = "200" ]; then
+              echo "HTTP 200"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "A interface não respondeu HTTP 200 na porta 8501. Último código: ${codigo:-nenhum}"
+          exit 1
+
+      - name: Conferir que os valores fictícios não aparecem nos logs
+        run: |
+          docker logs trixter-web-validacao > /tmp/logs-web.txt 2>&1
+          if grep -F -q -e "$SENHA_FICTICIA" -e "$SENHA_BANCO_FICTICIA" /tmp/logs-web.txt; then
+            echo "Um valor fictício apareceu nos logs do contêiner."
+            exit 1
+          fi
+
+      - name: Encerrar o contêiner
+        if: always()
+        run: docker rm --force trixter-web-validacao
+
+      - name: Preparar o Python dos testes
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependências dos testes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc unixodbc-dev
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-testes.txt
+
+      - name: Executar os testes da imagem web
+        run: python -m pytest tests/test_imagem_web.py -q
+
+      - name: Executar a suíte completa
+        run: python -m pytest -q

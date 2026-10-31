@@ -1,0 +1,196 @@
+# Exemplo documental inativo: requer configuracao propria antes de qualquer uso.
+# Copia a tag latest do executor para uma tag de backup do mesmo manifesto.
+# Não constrói imagem, não executa o contêiner e não recebe segredo de banco ou e-mail.
+#
+# --prefer-index=false faz o Buildx publicar o manifesto original.
+# Sem essa opção, um manifesto único vira um índice com outro digest.
+#
+# O grupo de concorrência abaixo serializa apenas disparos deste workflow.
+# Ele não impede o workflow Imagem dos envios de publicar latest
+# nem o workflow Envio automático de usar essa tag.
+name: Preservar imagem atual dos envios
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: preservar-imagem-envios
+  cancel-in-progress: false
+
+permissions:
+  packages: write
+
+jobs:
+  preservar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      IMAGEM: ghcr.io/usuario-exemplo/trixter-envios:latest
+    steps:
+      - name: Entrar no GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Publicar a tag de backup do manifesto atual
+        run: |
+          set -euo pipefail
+
+          registrar() {
+            {
+              echo "## Preservação da imagem dos envios"
+              echo ""
+              echo "- Digest de latest no início: \`${1}\`"
+              echo "- Digest de latest na releitura: \`${2}\`"
+              echo "- Tag de backup: \`${3}\`"
+              echo "- Digest da tag de backup: \`${4}\`"
+              echo "- Resultado: ${5}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          ler_digest() {
+            local saida codigo digest
+            set +e
+            saida=$(docker buildx imagetools inspect "$1" 2>&1)
+            codigo=$?
+            set -e
+            if [ "$codigo" -ne 0 ]; then
+              printf '%s\n' "$saida" >&2
+              return "$codigo"
+            fi
+            digest=$(printf '%s\n' "$saida" | awk '/^Digest:[[:space:]]/ { print $2; exit }')
+            if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+              echo "O digest de $1 não pôde ser identificado." >&2
+              printf '%s\n' "$saida" >&2
+              return 1
+            fi
+            printf '%s\n' "$digest"
+          }
+
+          manifest_ausente() {
+            printf '%s\n' "$1" | grep -Eqi 'not found|manifest unknown|name unknown|no such manifest' \
+              && ! printf '%s\n' "$1" | grep -Eqi 'unauthorized|denied|authentication required|insufficient_scope'
+          }
+
+          classificar_indice() {
+            PRESERVAR_BRUTO=/tmp/preservar-bruto.json python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          try:
+              documento = json.loads(Path(os.environ["PRESERVAR_BRUTO"]).read_text(encoding="utf-8"))
+          except json.JSONDecodeError:
+              sys.exit(2)
+          tipos = {
+              "application/vnd.oci.image.index.v1+json",
+              "application/vnd.docker.distribution.manifest.list.v2+json",
+          }
+          manifestos = documento.get("manifests")
+          if (
+              documento.get("mediaType") in tipos
+              and isinstance(manifestos, list)
+              and len(manifestos) == 1
+              and isinstance(manifestos[0], dict)
+              and isinstance(manifestos[0].get("digest"), str)
+          ):
+              print(manifestos[0]["digest"])
+          else:
+              print("")
+          PY
+          }
+
+          encerrar() {
+            local codigo="$1"
+            local digest_backup="$2"
+            local resultado="$3"
+            local releitura codigo_relei
+            set +e
+            releitura=$(ler_digest "$IMAGEM")
+            codigo_relei=$?
+            set -e
+            if [ "$codigo_relei" -ne 0 ]; then
+              releitura="falha ao reler"
+              resultado="${resultado} A releitura de latest falhou."
+              codigo=1
+            elif [ "$releitura" != "$original" ]; then
+              resultado="${resultado} latest mudou durante a operação e agora aponta para \`${releitura}\`."
+              codigo=1
+            fi
+            registrar "$original" "$releitura" "$backup_ref" "$digest_backup" "$resultado"
+            exit "$codigo"
+          }
+
+          original=$(ler_digest "$IMAGEM") || {
+            registrar "não identificado" "não consultado" "não identificada" "não identificado" "falhou ao consultar latest."
+            exit 1
+          }
+          hex=${original#sha256:}
+          backup_ref="ghcr.io/usuario-exemplo/trixter-envios:backup-${hex}"
+          fonte="ghcr.io/usuario-exemplo/trixter-envios@${original}"
+
+          set +e
+          saida_backup=$(docker buildx imagetools inspect "$backup_ref" 2>&1)
+          codigo_backup=$?
+          set -e
+
+          acao=criar
+          if [ "$codigo_backup" -ne 0 ]; then
+            if ! manifest_ausente "$saida_backup"; then
+              printf '%s\n' "$saida_backup" >&2
+              encerrar 1 "não identificado" "falhou ao consultar a tag de backup. Nenhuma publicação foi feita."
+            fi
+          else
+            existente=$(printf '%s\n' "$saida_backup" | awk '/^Digest:[[:space:]]/ { print $2; exit }')
+            if ! printf '%s' "$existente" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+              printf '%s\n' "$saida_backup" >&2
+              encerrar 1 "não identificado" "falhou ao identificar o digest da tag de backup. Nenhuma publicação foi feita."
+            fi
+            if [ "$existente" = "$original" ]; then
+              acao=pronta
+            else
+              set +e
+              bruto=$(docker buildx imagetools inspect --raw "$backup_ref" 2>/tmp/preservar-backup.err)
+              codigo_bruto=$?
+              set -e
+              if [ "$codigo_bruto" -ne 0 ]; then
+                cat /tmp/preservar-backup.err >&2
+                encerrar 1 "$existente" "falhou ao ler o manifesto bruto da tag de backup. Nenhuma publicação foi feita."
+              fi
+              printf '%s' "$bruto" > /tmp/preservar-bruto.json
+              set +e
+              filho=$(classificar_indice)
+              codigo_classe=$?
+              set -e
+              if [ "$codigo_classe" -ne 0 ]; then
+                encerrar 1 "$existente" "falhou ao interpretar o manifesto bruto. Nenhuma publicação foi feita."
+              fi
+              if [ "$filho" = "$original" ]; then
+                acao=corrigir
+              else
+                encerrar 1 "$existente" "interrompido. A tag existente não é o manifesto original nem um índice de um único manifesto igual a ele. Nenhuma publicação foi feita."
+              fi
+            fi
+          fi
+
+          if [ "$acao" = "criar" ] || [ "$acao" = "corrigir" ]; then
+            if ! docker buildx imagetools create --prefer-index=false --tag "$backup_ref" "$fonte"; then
+              encerrar 1 "não identificado" "falhou ao publicar a tag de backup com --prefer-index=false."
+            fi
+            if [ "$acao" = "criar" ]; then
+              situacao="A tag foi criada com o manifesto original."
+            else
+              situacao="A tag foi corrigida: o índice de um único manifesto foi substituído pelo manifesto original."
+            fi
+          else
+            situacao="A tag já apontava para o digest original. Nenhuma publicação foi feita."
+          fi
+
+          confirmado=$(ler_digest "$backup_ref") || encerrar 1 "não identificado" "falhou ao reler a tag de backup."
+          if [ "$confirmado" != "$original" ]; then
+            encerrar 1 "$confirmado" "falhou. A tag de backup ficou em \`${confirmado}\`, diferente do digest original."
+          fi
+
+          encerrar 0 "$confirmado" "confirmada. ${situacao}"

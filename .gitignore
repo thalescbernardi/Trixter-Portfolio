@@ -1,0 +1,51 @@
+# Credenciais e segredos
+.streamlit/secrets.toml
+secrets.toml
+.env
+
+# Python
+_pycache_/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Ambientes virtuais
+venv/
+.venv/
+env/
+
+# VS Code
+.vscode/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Arquivos temporários
+*.tmp
+*.log
+.test-temp-*/
+Microsoft/
+
+desktop.ini
+
+# Arquivos privados e resultados locais (portfolio)
+.env.*
+**/.env
+**/.env.*
+**/secrets.toml
+*.bak
+*.bacpac
+*.mdf
+*.ldf
+*.db
+*.sqlite
+*.sqlite3
+*.pfx
+*.p12
+*.pem
+*.key
+.pytest_tmp/
+validacao/
+htmlcov/
+.coverage*

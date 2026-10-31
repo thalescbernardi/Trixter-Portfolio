@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-4 -2 72 72">
+  <path
+    d="M20 4
+       C23 2 27 3 32 5
+       C37 3 41 2 44 4
+       C43 8 41 11 39 13
+       L25 13
+       C23 10 21 7 20 4
+       Z"
+    fill="#A67C00"
+  />
+  <path
+    d="M25 14.5
+       C22 20 12 30 10 43
+       C8 57 17 65 32 65
+       C47 65 56 57 54 43
+       C52 30 42 20 39 14
+       Z"
+    fill="#b87928"
+  />
+  <rect x="30.75" y="26" width="2.5" height="6" rx="1.25" fill="#FFFFFF"/>
+  <rect x="30.75" y="49.50" width="2.5" height="6" rx="1.25" fill="#FFFFFF"/>
+  <text
+    x="32"
+    y="52"
+    text-anchor="middle"
+    fill="#FFFFFF"
+    font-size="30"
+    font-family="Arial, sans-serif"
+    font-weight="500"
+  >S</text>
+</svg>

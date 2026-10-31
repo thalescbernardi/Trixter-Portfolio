@@ -1,0 +1,159 @@
+# Exemplo documental inativo: requer configuracao propria antes de qualquer uso.
+# Manutencao sem SMTP. Nao reativa envios.yml nem promove imagens.
+name: Expurgos de manutencao
+
+on:
+  schedule:
+    - cron: "10 14 * * *"
+  workflow_dispatch:
+    inputs:
+      operacao:
+        description: Validar inicializacao isolada ou executar os expurgos reais
+        required: true
+        type: choice
+        default: Validar
+        options:
+          - Validar
+          - Expurgar
+
+permissions:
+  contents: read
+  packages: read
+  id-token: write
+
+concurrency:
+  group: expurgos-manutencao
+  cancel-in-progress: false
+
+jobs:
+  validar:
+    if: github.event_name == 'workflow_dispatch' && inputs.operacao == 'Validar'
+    permissions:
+      contents: read
+      packages: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      IMAGE: ghcr.io/usuario-exemplo/trixter-envios@sha256:876bf7472c4e4e5e00e97645acaa6b739280f459b4043e561c7835956c4d2197
+    steps:
+      - name: Obter o script para validacao
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Baixar a imagem fixa para validacao
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE"
+
+      - name: Validar compilacao e imports sem executar main
+        run: |
+          set -euo pipefail
+          test -f "$GITHUB_WORKSPACE/executar_expurgos.py"
+          docker run --rm --interactive --network none --read-only --entrypoint python \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/executar_expurgos.py,target=/app/executar_expurgos.py,readonly" \
+            "$IMAGE" -B - <<'PY'
+          from pathlib import Path
+          import runpy
+          caminho = Path('/app/executar_expurgos.py')
+          compile(caminho.read_text(encoding='utf-8'), str(caminho), 'exec')
+          modulo = runpy.run_path(str(caminho), run_name='validacao_expurgos')
+          assert callable(modulo['main'])
+          assert modulo['__name__'] != '__main__'
+          print('validacao_inicializacao=aprovada main_nao_executado')
+          PY
+
+  limpar:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.operacao == 'Expurgar')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      IMAGE: ghcr.io/usuario-exemplo/trixter-envios@sha256:876bf7472c4e4e5e00e97645acaa6b739280f459b4043e561c7835956c4d2197
+      AZURE_CLIENT_ID: 00000000-0000-0000-0000-000000000001
+      AZURE_TENANT_ID: 00000000-0000-0000-0000-000000000002
+      AZURE_SUBSCRIPTION_ID: 00000000-0000-0000-0000-000000000003
+      RULE_NAME: trixter-expurgo-${{ github.run_id }}-${{ github.run_attempt }}
+      TRIXTER_AUTOMACAO_FUSO_HORARIO: America/Sao_Paulo
+      TRIXTER_DATABASE_DRIVER: ODBC Driver 18 for SQL Server
+      TRIXTER_DATABASE_SERVER: servidor-sql-exemplo.database.windows.net
+      TRIXTER_DATABASE_NAME: banco-exemplo
+      TRIXTER_DATABASE_TRUSTED_CONNECTION: "no"
+      TRIXTER_DATABASE_ENCRYPT: "yes"
+      TRIXTER_DATABASE_TRUST_SERVER_CERTIFICATE: "no"
+    steps:
+      - name: Obter o script de manutencao
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Conferir secrets SQL
+        env:
+          TRIXTER_DATABASE_USUARIO: ${{ secrets.TRIXTER_DATABASE_USUARIO }}
+          TRIXTER_DATABASE_SENHA: ${{ secrets.TRIXTER_DATABASE_SENHA }}
+        run: |
+          set -euo pipefail
+          test -n "$TRIXTER_DATABASE_USUARIO"
+          test -n "$TRIXTER_DATABASE_SENHA"
+          test -f "$GITHUB_WORKSPACE/executar_expurgos.py"
+
+      - name: Baixar a imagem fixa
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE"
+
+      - name: Entrar no Azure
+        id: azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Abrir o firewall para este runner
+        id: firewall
+        run: |
+          set -euo pipefail
+          ip=$(curl -fsS --max-time 20 https://api.ipify.org | tr -d '[:space:]')
+          if ! [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            echo "IP publico invalido" >&2
+            exit 1
+          fi
+          az sql server firewall-rule create \
+            -g grupo-recursos-exemplo -s servidor-sql-exemplo -n "$RULE_NAME" \
+            --start-ip-address "$ip" --end-ip-address "$ip" --query name -o tsv
+
+      - name: Executar somente expurgos
+        env:
+          TRIXTER_DATABASE_USUARIO: ${{ secrets.TRIXTER_DATABASE_USUARIO }}
+          TRIXTER_DATABASE_SENHA: ${{ secrets.TRIXTER_DATABASE_SENHA }}
+        run: |
+          set -euo pipefail
+          sleep 45
+          docker run --rm --entrypoint python \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/executar_expurgos.py,target=/app/executar_expurgos.py,readonly" \
+            -e TRIXTER_AUTOMACAO_FUSO_HORARIO \
+            -e TRIXTER_DATABASE_DRIVER \
+            -e TRIXTER_DATABASE_SERVER \
+            -e TRIXTER_DATABASE_NAME \
+            -e TRIXTER_DATABASE_TRUSTED_CONNECTION \
+            -e TRIXTER_DATABASE_ENCRYPT \
+            -e TRIXTER_DATABASE_TRUST_SERVER_CERTIFICATE \
+            -e TRIXTER_DATABASE_USUARIO \
+            -e TRIXTER_DATABASE_SENHA \
+            "$IMAGE" -B /app/executar_expurgos.py
+
+      - name: Fechar o firewall
+        if: always() && steps.azure.outcome == 'success'
+        run: |
+          set -euo pipefail
+          existe=$(az sql server firewall-rule list -g grupo-recursos-exemplo -s servidor-sql-exemplo \
+            --query "[?name=='${RULE_NAME}'].name" -o tsv)
+          if [ -n "$existe" ]; then
+            az rest --method delete --uri "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/grupo-recursos-exemplo/providers/Microsoft.Sql/servers/servidor-sql-exemplo/firewallRules/${RULE_NAME}?api-version=2021-11-01"
+          fi

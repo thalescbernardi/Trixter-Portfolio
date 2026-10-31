@@ -1,0 +1,63 @@
+# Exemplo documental inativo: requer configuracao propria antes de qualquer uso.
+# Publica a imagem da interface no GHCR.
+# Não publica a imagem do executor, não envia e-mails e não acessa o Azure.
+name: Imagem web
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: imagem-web
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      IMAGE: ghcr.io/usuario-exemplo/trixter-web:${{ github.sha }}
+    steps:
+      - name: Obter o código
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Construir a imagem web
+        run: |
+          docker build \
+            --file Dockerfile.web \
+            --label org.opencontainers.image.source="https://github.com/${{ github.repository }}" \
+            --label org.opencontainers.image.revision="${{ github.sha }}" \
+            --tag "$IMAGE" \
+            .
+
+      - name: Confirmar que o build não incorporou secrets.toml
+        run: |
+          docker run --rm --entrypoint python "$IMAGE" -c \
+            "from pathlib import Path; raise SystemExit(0 if not Path('/app/.streamlit/secrets.toml').exists() else 1)"
+
+      - name: Publicar no GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          case "$IMAGE" in
+            ghcr.io/usuario-exemplo/trixter-web:"${GITHUB_SHA}") ;;
+            *)
+              echo "A publicação aceita somente ghcr.io/usuario-exemplo/trixter-web com a tag do commit."
+              exit 1
+              ;;
+          esac
+          echo "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.repository_owner }}" --password-stdin
+          docker push "$IMAGE" | tee /tmp/push-web.txt
+          {
+            echo "## Imagem web"
+            echo ""
+            echo "- Nome: \`ghcr.io/usuario-exemplo/trixter-web\`"
+            echo "- Tag: \`${GITHUB_SHA}\`"
+            echo "- A tag latest não foi publicada."
+          } >> "$GITHUB_STEP_SUMMARY"
+          awk '/digest:/ { print "- Digest: `" $NF "`" }' /tmp/push-web.txt >> "$GITHUB_STEP_SUMMARY"

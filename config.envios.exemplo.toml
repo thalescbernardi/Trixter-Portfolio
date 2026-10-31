@@ -1,0 +1,21 @@
+# Copie para um arquivo privado (por exemplo .streamlit/secrets.toml).
+# Nunca versione o arquivo preenchido. A interface pode usar as mesmas seções.
+[database]
+driver = "ODBC Driver 17 for SQL Server"
+server = "SEU_SERVIDOR_SQL"
+database = "SEU_BANCO"
+trusted_connection = "yes"
+# Para autenticação SQL: trusted_connection="no", usuario="...", senha="..."
+# encrypt = "yes"
+# trust_server_certificate = "no"
+
+[email]
+remetente = "remetente@seu-dominio.com"
+servidor = "smtp-relay.brevo.com"
+porta = 587
+usuario = "SEU_LOGIN_SMTP_BREVO"
+senha = "SUA_CHAVE_SMTP_BREVO"
+
+[automacao]
+fuso_horario = "America/Sao_Paulo"
+max_tentativas = 3
